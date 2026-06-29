@@ -171,9 +171,10 @@ resource "google_network_services_authz_extension" "iap" {
   timeout   = var.authz_extension_timeout
   fail_open = var.authz_extension_fail_open
 
-  metadata = var.iap_iam_enforcement_mode != null ? {
-    iamEnforcementMode = var.iap_iam_enforcement_mode
-  } : null
+  metadata = merge(
+    { iapPolicyVersion = "V1" },
+    var.iap_iam_enforcement_mode != null ? { iamEnforcementMode = var.iap_iam_enforcement_mode } : {}
+  )
 }
 
 # Model Armor CONTENT_AUTHZ service extension. Regional REP endpoint —

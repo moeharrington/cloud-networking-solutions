@@ -144,7 +144,7 @@ resource "google_storage_bucket" "cloudbuild" {
   name                        = coalesce(var.cloudbuild_bucket_name, "${var.project_id}_cloudbuild")
   location                    = var.region
   uniform_bucket_level_access = true
-  force_destroy               = false
+  force_destroy               = true
 
   lifecycle_rule {
     condition {
@@ -165,14 +165,14 @@ resource "google_storage_bucket" "cloudbuild" {
 resource "google_storage_bucket_iam_member" "cloudbuild_compute_sa" {
   bucket = google_storage_bucket.cloudbuild.name
   role   = "roles/storage.admin"
-  member = "serviceAccount:${module.foundation.project_number}-compute@developer.gserviceaccount.com"
+  member = "serviceAccount:run-build-sa@${var.project_id}.iam.gserviceaccount.com"
 }
 
-# Grant Compute Engine default SA artifact registry access for Cloud Build
+# Grant build SA artifact registry access for Cloud Build
 resource "google_project_iam_member" "cloudbuild_registry" {
   project = var.project_id
   role    = "roles/artifactregistry.writer"
-  member  = "serviceAccount:${module.foundation.project_number}-compute@developer.gserviceaccount.com"
+  member  = "serviceAccount:run-build-sa@${var.project_id}.iam.gserviceaccount.com"
 }
 
 # Grant Cloud Build service agent storage access for source tarballs
