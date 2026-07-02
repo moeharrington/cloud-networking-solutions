@@ -17,19 +17,30 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Prevent urllib3 from using PyOpenSSL, which contains a bug causing
-# "ValueError: Context has already been used to create a Connection"
-# when OTEL span exporter attempts to push telemetry after an HTTP error.
-try:
-    import urllib3.contrib.pyopenssl
+def _disable_urllib3_pyopenssl_when_mtls_disabled() -> None:
+    # Keep in sync with ../sitecustomize.py. The startup hook should run first
+    # in Agent Runtime; this is a defensive fallback for local/import paths.
+    if os.getenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "").lower() != "false":
+        return
 
-    urllib3.contrib.pyopenssl.extract_from_urllib3()
-except Exception:
-    pass
+    try:
+        import urllib3.contrib.pyopenssl
 
-import google.auth
+        urllib3.contrib.pyopenssl.extract_from_urllib3()
 
-from . import agent  # noqa: F401
+        def _noop_inject_into_urllib3() -> None:
+            urllib3.contrib.pyopenssl.extract_from_urllib3()
+
+        urllib3.contrib.pyopenssl.inject_into_urllib3 = _noop_inject_into_urllib3
+    except Exception:
+        pass
+
+
+_disable_urllib3_pyopenssl_when_mtls_disabled()
+
+import google.auth  # noqa: E402
+
+from . import agent  # noqa: E402,F401
 
 try:
     _, project_id = google.auth.default()

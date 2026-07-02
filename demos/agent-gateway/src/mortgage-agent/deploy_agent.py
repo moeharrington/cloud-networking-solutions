@@ -14,8 +14,9 @@
 
 """Deploy the mortgage assistant agent to Vertex AI Agent Engine.
 
-Uses the vertexai.agent_engines SDK with build_options to deploy the agent
-and work around the .venv/bin/python platform bug.
+Deploys a normal Agent Runtime HTTP container. The container serves the ADK
+agent through both the A2A JSON-RPC helper and the Reasoning Engine
+``/api/stream_reasoning_engine`` contract used by Vertex AI Playground.
 
 The agent discovers its MCP tools at runtime by listing `mcpServers` in the
 Agent Registry for `--project` / `--region`, so no per-service URL or URI
@@ -51,12 +52,21 @@ import argparse
 import json
 import os
 import shutil
-import stat
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+
+
+def _credentials_from_access_token():
+    access_token = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN")
+    if not access_token:
+        return None
+
+    from google.oauth2.credentials import Credentials
+
+    return Credentials(token=access_token)
 
 
 def _ge_deploy(
@@ -211,6 +221,18 @@ def _ge_deploy(
         body = e.read().decode()
         print(f"ERROR registering agent: {e.code} {body}", file=sys.stderr)
         sys.exit(1)
+
+
+def _existing_plain_env_vars(agent: object) -> dict[str, str]:
+    spec = getattr(getattr(agent, "api_resource", None), "spec", None)
+    deployment_spec = getattr(spec, "deployment_spec", None) if spec else None
+    env = getattr(deployment_spec, "env", None) if deployment_spec else None
+    result: dict[str, str] = {}
+    for var in env or []:
+        name = getattr(var, "name", None)
+        if name:
+            result[name] = getattr(var, "value", "") or ""
+    return result
 
 
 def main() -> None:
@@ -429,9 +451,9 @@ def main() -> None:
         print(f"  MCP invoker SA:     {args.mcp_invoker_sa}")
     print()
 
-    # Configure the agent module's runtime environment. These are read at
-    # `from agent.agent import root_agent` time below, so they must be set
-    # before the import — not just in the deployed agent's env_vars.
+    # Configure the agent module's runtime environment. These are mirrored into
+    # the deployed agent's env_vars below; they are also set here so any local
+    # `agent` import (e.g. building the agent card) sees consistent values.
     os.environ["MODEL_NAME"] = args.model
     os.environ["MCP_REGISTRY_PROJECT"] = args.project
     os.environ["MCP_REGISTRY_LOCATION"] = args.region
@@ -444,24 +466,23 @@ def main() -> None:
 
     import vertexai
 
+    credentials = _credentials_from_access_token()
+
     vertexai.init(
         project=args.project,
         location=args.region,
         staging_bucket=staging_bucket,
+        credentials=credentials,
     )
 
     client = vertexai.Client(
         project=args.project,
         location=args.region,
+        credentials=credentials,
         http_options=dict(api_version="v1beta1"),
     )
 
-    from agent.agent import root_agent
-    from agent.otel_setup import InstrumentedAdkApp
-
-    app = InstrumentedAdkApp(agent=root_agent, enable_tracing=True)
-
-    # Build PSC-I and agent identity config
+    # Build PSC-I, Agent Gateway, and agent identity config.
     config = {}
     if args.network_attachment:
         psc_config = {"network_attachment": args.network_attachment}
@@ -489,112 +510,78 @@ def main() -> None:
             os.path.join(staging_dir, "agent"),
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
         )
-
-        # Create installation_scripts/ with a workaround for the
-        # platform bug where .venv/bin/python doesn't exist in the
-        # base image but the Dockerfile's compileall step expects it.
-        scripts_dir = os.path.join(staging_dir, "installation_scripts")
-        os.makedirs(scripts_dir)
-        script_path = os.path.join(scripts_dir, "create_venv.sh")
-        with open(script_path, "w") as f:
-            f.write("#!/bin/bash\n")
-            f.write("# Workaround: create a proper .venv for the compileall\n")
-            f.write("# step (step 20/21). The base image's Dockerfile runs:\n")
-            f.write("#   .venv/bin/python -m compileall \\\n")
-            f.write('#     "$(.venv/bin/python -c \\"import site; print(site.getsitepackages()[0])\\")"\n')
-            f.write("# A plain symlink causes site.getsitepackages()[0] to\n")
-            f.write("# return /usr/local/lib/python3.12/site-packages/ which\n")
-            f.write("# is root-owned => PermissionError as appuser.\n")
-            f.write("# Fix: create pyvenv.cfg so Python treats .venv/ as a\n")
-            f.write("# virtualenv with writable site-packages.\n")
-            f.write("set -e\n")
-            f.write("PYTHON3=$(which python3)\n")
-            f.write(
-                "PY_VER=$(python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")')\n"
-            )
-            f.write("mkdir -p /code/.venv/bin\n")
-            f.write("mkdir -p /code/.venv/lib/python${PY_VER}/site-packages\n")
-            f.write('ln -sf "$PYTHON3" /code/.venv/bin/python\n')
-            f.write('ln -sf "$PYTHON3" /code/.venv/bin/python3\n')
-            f.write("cat > /code/.venv/pyvenv.cfg << PYCFG\n")
-            f.write("home = $(dirname $PYTHON3)\n")
-            f.write("include-system-site-packages = true\n")
-            f.write("PYCFG\n")
-            f.write('echo "Created .venv virtualenv (site-packages: /code/.venv/lib/python${PY_VER}/site-packages)"\n')
-        os.chmod(script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+        shutil.copy2(os.path.join(agent_dir, "sitecustomize.py"), staging_dir)
+        for filename in ("Dockerfile", "pyproject.toml", "README.md"):
+            shutil.copy2(os.path.join(agent_dir, filename), staging_dir)
 
         os.chdir(staging_dir)
 
-        deploy_config = dict(
-            staging_bucket=staging_bucket,
-            requirements=[
-                # Upper-bound pin keeps the container on a release where
-                # `vertexai.agent_engines.AdkApp` (the public import used by
-                # agent/otel_setup.py) resolves the same class the operator
-                # pickled. Unpinned, PyPI advanced to 1.153.1 which had already
-                # removed the older `vertexai.agent_engines.templates.adk` path
-                # and broke unpickle in the container. The `[adk]` extra is
-                # omitted because google-adk is pinned explicitly below; the
-                # extra would just re-declare the same dep with a looser
-                # range. Keep aligned with pyproject.toml.
-                "google-cloud-aiplatform[agent_engines]>=1.149.0,<1.154.0",
-                # Pin google-adk to a tagged PyPI release (was previously
-                # tracking adk-python@main, which started publishing 2.0.0b1
-                # and conflicted with google-cloud-aiplatform's [adk] extra).
-                # The [a2a,agent-identity] extras pull a2a-sdk and
-                # google-cloud-iamconnectorcredentials at the versions
-                # google-adk itself requires — without them registry
-                # discovery fails on `cannot import name 'TransportProtocol'`
-                # (a2a) or
-                # `No module named google.cloud.iamconnectorcredentials_v1alpha`.
-                # Keep aligned with pyproject.toml.
-                "google-adk[a2a,agent-identity]==1.34.0",
-                "google-auth>=2.0",
-                "cloudpickle",
-                "pydantic",
-                "opentelemetry-instrumentation-google-genai",
-                "opentelemetry-exporter-gcp-logging",
-            ],
-            extra_packages=[
-                "agent",
-                "installation_scripts/create_venv.sh",
-            ],
-            build_options={
-                "installation_scripts": [
-                    "installation_scripts/create_venv.sh",
-                ],
-            },
-            env_vars={
-                # Make denied MCP tool calls (gateway 403) fail fast instead of
-                # hanging the turn as a broken-stream TaskGroup/TimeoutError.
-                "ADK_ENABLE_MCP_GRACEFUL_ERROR_HANDLING": "true",
-                "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true",
-                "GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES": "false",
-                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
-                "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
-                "OTEL_TRACES_SAMPLER_ARG": "1.0",
-                "GOOGLE_GENAI_USE_VERTEXAI": "True",
-                "GOOGLE_CLOUD_LOCATION": args.model_endpoint_location,
-                "MODEL_NAME": args.model,
-                "MCP_REGISTRY_PROJECT": args.project,
-                "MCP_REGISTRY_LOCATION": args.region,
-                **({"MCP_REGISTRY_FILTER": args.registry_filter} if args.registry_filter else {}),
-                **({"MCP_REGISTRY_ENDPOINT": args.registry_endpoint} if args.registry_endpoint else {}),
-                **({"MCP_INVOKER_SA_EMAIL": args.mcp_invoker_sa} if args.mcp_invoker_sa else {}),
-            },
+        from vertexai._genai import _agent_engines_utils
+        from vertexai._genai.types import IdentityType
+
+        env_vars = {
+            "ADK_ENABLE_MCP_GRACEFUL_ERROR_HANDLING": "true",
+            "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY": "true",
+            "GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES": "false",
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
+            "GOOGLE_GENAI_USE_VERTEXAI": "True",
+            "GOOGLE_CLOUD_LOCATION": args.model_endpoint_location,
+            "GOOGLE_API_USE_CLIENT_CERTIFICATE": "false",
+            "GOOGLE_API_USE_MTLS_ENDPOINT": "never",
+            "MODEL_NAME": args.model,
+            "MCP_REGISTRY_PROJECT": args.project,
+            "MCP_REGISTRY_LOCATION": args.region,
+            **({"MCP_REGISTRY_FILTER": args.registry_filter} if args.registry_filter else {}),
+            **({"MCP_REGISTRY_ENDPOINT": args.registry_endpoint} if args.registry_endpoint else {}),
+            **({"MCP_INVOKER_SA_EMAIL": args.mcp_invoker_sa} if args.mcp_invoker_sa else {}),
+        }
+        if args.update:
+            existing_agent = client.agent_engines.get(name=args.update)
+            for key, value in _existing_plain_env_vars(existing_agent).items():
+                env_vars.setdefault(key, value)
+            env_vars["APP_URL"] = (
+                f"https://{args.region}-aiplatform.googleapis.com/reasoningEngines/v1/"
+                f"{args.update}/api"
+            )
+
+        api_config = client.agent_engines._create_config(
+            mode="update" if args.update else "create",
             display_name=args.display_name,
             description=description,
-            min_instances=2,
+            source_packages=[
+                "agent",
+                "sitecustomize.py",
+                "Dockerfile",
+                "pyproject.toml",
+                "README.md",
+            ],
+            env_vars=env_vars,
+            min_instances=1,
+            max_instances=1,
             resource_limits={"cpu": "4", "memory": "8Gi"},
+            identity_type=IdentityType.AGENT_IDENTITY if args.enable_agent_identity else None,
+            agent_framework="google-adk",
+            psc_interface_config=config.get("psc_interface_config"),
+            image_spec={},
+            **({"agent_gateway_config": config["agent_gateway_config"]} if "agent_gateway_config" in config else {}),
         )
 
-        if config:
-            deploy_config.update(config)
-
         if args.update:
-            engine = client.agent_engines.update(name=args.update, agent=app, config=deploy_config)
+            operation = client.agent_engines._update(name=args.update, config=api_config)
         else:
-            engine = client.agent_engines.create(agent=app, config=deploy_config)
+            operation = client.agent_engines._create(config=api_config)
+
+        print(f"  Operation: {operation.name}")
+        _agent_engines_utils._await_operation(
+            operation_name=operation.name,
+            get_operation_fn=client.agent_engines._get_agent_operation,
+        )
+        completed_operation = client.agent_engines._get_agent_operation(operation_name=operation.name)
+        if completed_operation.error:
+            raise RuntimeError(f"Deployment failed: {completed_operation.error}")
+
+        reasoning_engine_name = operation.name.rsplit("/operations/", 1)[0]
+        engine = client.agent_engines.get(name=reasoning_engine_name)
     finally:
         os.chdir(original_cwd)
         shutil.rmtree(staging_dir, ignore_errors=True)

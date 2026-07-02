@@ -14,6 +14,7 @@
 
 """ADK agent definition for the mortgage assistant with MCP tool connections."""
 
+import importlib
 import logging
 import os
 from typing import Any
@@ -21,12 +22,21 @@ from urllib.parse import urlparse
 
 import httpx
 from google.adk.agents.llm_agent import Agent
+from google.adk.apps import App
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 
 from . import tools
 
 logger = logging.getLogger(__name__)
+
+try:
+    import google.adk.integrations as _adk_integrations
+
+    _agent_registry_module = importlib.import_module("google.adk.integrations.agent_registry")
+    setattr(_adk_integrations, "agent_registry", _agent_registry_module)
+except ImportError:
+    pass
 
 
 def _build_impersonation_factory(target_url: str, target_sa_email: str):
@@ -365,16 +375,15 @@ def _discover_mcp_toolsets() -> list:
 
     try:
         # Imported lazily so the agent module loads even when ADK's optional
-        # dependency chain is not satisfied locally. The deployed image must
-        # pin a2a-sdk in deploy_agent.py's requirements list, otherwise this
-        # import fails with `No module named 'a2a'` and discovery is skipped.
+        # dependency chain is not satisfied locally. The deployed image installs
+        # the extras declared in pyproject.toml.
         from google.adk.integrations import agent_registry as _ar_module
         from google.adk.integrations.agent_registry import AgentRegistry
     except ImportError as e:
         logger.warning(
             "MCP registry discovery skipped: ADK agent_registry import failed (%s). "
-            "On a deployed agent this means the requirements list in deploy_agent.py "
-            "is missing a transitive dep (typically a2a-sdk).",
+            "On a deployed agent this means pyproject.toml is missing an ADK extra "
+            "or transitive dependency.",
             e,
         )
         _CACHED_TOOLSETS = []
@@ -518,7 +527,7 @@ def _build_agent():
 
     return _PickleSafeAgent(
         model=os.environ.get("MODEL_NAME", "gemini-3.1-flash-lite-preview"),
-        name="mortgage_assistant_agent",
+        name="mortgage_agent",
         description=(
             "A mortgage underwriting assistant that connects to legacy document management, "
             "income verification, and corporate email systems through an Agent Gateway."
@@ -530,3 +539,4 @@ def _build_agent():
 
 
 root_agent = _build_agent()
+app = App(root_agent=root_agent, name="mortgage_agent")

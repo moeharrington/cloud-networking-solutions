@@ -1,20 +1,25 @@
 # Mortgage Assistant Agent
 
-ADK mortgage assistant agent deployed to Agent Runtime. Connects to
-legacy DMS, income verification, and corporate email MCP servers running in GKE
-via PSC Interface.
+ADK mortgage assistant agent deployed to Agent Runtime as an HTTP container.
+The container exposes the same agent through:
+
+- A2A JSON-RPC via ADK `to_a2a(...)` at `/a2a/mortgage_agent`
+- Vertex AI Playground compatibility via `/api/stream_reasoning_engine`
+
+This mirrors the working `simple-a2a-agent` example. In Agent Runtime, ADK
+sessions use Vertex AI session storage so Playground can reload responses after
+stream completion. A2A task state uses the default task store from `to_a2a(...)`;
+the demo is deployed with one runtime instance.
 
 ## Prerequisites
 
-- Terraform infrastructure deployed (VPC, GKE, PSC Interface, DNS zones)
-- MCP servers deployed to GKE and reachable via the internal gateway
-- `uv` installed for Python dependency management
+- Terraform infrastructure deployed
+- MCP servers registered in Agent Registry and reachable through Agent Gateway
+- `uv` installed for local Python commands
 
 ## Deploy
 
-### Get values from Terraform
-
-From the `terraform/` directory, retrieve the required outputs:
+Get values from Terraform:
 
 ```bash
 cd ../../terraform
@@ -25,16 +30,13 @@ export PSC_ATTACHMENT=$(terraform output -raw psc_interface_network_attachment_i
 export DNS_PEERING_DOMAIN=$(terraform output -raw psc_interface_dns_peering_domain)
 ```
 
-### Create a new agent
+Create a new Agent Runtime engine:
 
 ```bash
 cd ../src/mortgage-agent
 
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --dms-mcp-url=https://dms.${DNS_PEERING_DOMAIN%%.}/mcp \
-  --income-verification-url=https://income-verification.${DNS_PEERING_DOMAIN%%.} \
-  --email-mcp-url=https://email.${DNS_PEERING_DOMAIN%%.}/mcp \
   --network-attachment=$PSC_ATTACHMENT \
   --dns-peering-domain=$DNS_PEERING_DOMAIN \
   --dns-peering-target-project=$PROJECT_ID \
@@ -42,14 +44,11 @@ uv run python deploy_agent.py \
   --enable-agent-identity
 ```
 
-### Update an existing agent
+Update an existing engine:
 
 ```bash
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --dms-mcp-url=https://dms.${DNS_PEERING_DOMAIN%%.}/mcp \
-  --income-verification-url=https://income-verification.${DNS_PEERING_DOMAIN%%.} \
-  --email-mcp-url=https://email.${DNS_PEERING_DOMAIN%%.}/mcp \
   --network-attachment=$PSC_ATTACHMENT \
   --dns-peering-domain=$DNS_PEERING_DOMAIN \
   --dns-peering-target-project=$PROJECT_ID \
@@ -58,7 +57,39 @@ uv run python deploy_agent.py \
   --update=projects/PROJECT_NUMBER/locations/us-central1/reasoningEngines/ENGINE_ID
 ```
 
-### Register in Gemini Enterprise
+## A2A Smoke Test
+
+Fetch the agent card:
+
+```bash
+ENGINE=projects/PROJECT_NUMBER/locations/us-central1/reasoningEngines/ENGINE_ID
+BASE="https://us-central1-aiplatform.googleapis.com/reasoningEngines/v1/${ENGINE}/api"
+
+curl -s -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  "${BASE}/a2a/mortgage_agent/.well-known/agent-card.json"
+```
+
+Send an A2A JSON-RPC message:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+  -H "Content-Type: application/json" \
+  "${BASE}/a2a/mortgage_agent/" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "smoke",
+    "method": "message/send",
+    "params": {
+      "message": {
+        "messageId": "m1",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "Say hello."}]
+      }
+    }
+  }'
+```
+
+## Register in Gemini Enterprise
 
 Add `--ge-deploy` with the required OAuth and Gemini Enterprise flags:
 
@@ -67,9 +98,6 @@ export OAUTH_CLIENT_SECRET=<your-oauth-client-secret>
 
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --dms-mcp-url=https://dms.${DNS_PEERING_DOMAIN%%.}/mcp \
-  --income-verification-url=https://income-verification.${DNS_PEERING_DOMAIN%%.} \
-  --email-mcp-url=https://email.${DNS_PEERING_DOMAIN%%.}/mcp \
   --network-attachment=$PSC_ATTACHMENT \
   --dns-peering-domain=$DNS_PEERING_DOMAIN \
   --dns-peering-target-project=$PROJECT_ID \
@@ -80,36 +108,9 @@ uv run python deploy_agent.py \
   --oauth-client-id=<oauth-client-id>
 ```
 
-## Architecture
-
-```
-Agent Runtime (Reasoning Engine)
-  |
-  |-- PSC Interface NIC (10.11.0.0/28 subnet)
-  |     |
-  |     |-- DNS Peering → inference-vpc → internal DNS zone
-  |     |
-  |     └── TCP/443 → Internal Gateway (10.0.0.2)
-  |                       |
-  |                       ├── dms.internal.demo.sc-ccn.xyz
-  |                       ├── income-verification.internal.demo.sc-ccn.xyz
-  |                       └── corporate-email.internal.demo.sc-ccn.xyz
-  |
-  └── Agent Platform APIs (Gemini models, session management)
-```
-
-## Terraform Outputs Reference
-
-| Output | Description | deploy_agent.py flag |
-|--------|-------------|---------------------|
-| `foundation_project_id` | GCP project ID | `--project` |
-| `vpc_name` | VPC network name | `--dns-peering-target-network` |
-| `psc_interface_network_attachment_id` | PSC Interface network attachment | `--network-attachment` |
-| `psc_interface_dns_peering_domain` | DNS domain for peering | `--dns-peering-domain` |
-
 ## Local Testing
 
 ```bash
 uv sync
-adk web
+uv run uvicorn agent.fast_api_app:app --host 0.0.0.0 --port 8080
 ```
