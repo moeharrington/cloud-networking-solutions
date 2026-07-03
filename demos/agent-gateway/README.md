@@ -56,7 +56,7 @@ agent-gateway/
 │   ├── income-verification-api.yaml.tmpl
 │   └── legacy-dms.yaml.tmpl
 ├── scripts/
-│   └── grant_agent_mcp_egress.sh    # Per-MCP IAP egress IAM (run after deploy)
+│   └── grant_agent_mcp_egress.sh    # MCP/API endpoint IAP egress IAM
 ├── skaffold.yaml.tmpl               # Multi-service build + Cloud Run deploy
 ├── codelab.md                       # Full walkthrough (source of truth)
 └── docs/architecture.png
@@ -122,21 +122,30 @@ gcloud projects add-iam-policy-binding ${PROJECT_ID} \
 skaffold run
 
 # 7. Deploy the mortgage agent to Agent Runtime
+export PROJECT_NUMBER=$(cd terraform && terraform output -raw foundation_project_number)
+export ORG_ID=$(cd terraform && terraform output -raw organization_id)
+export AGENT_GATEWAY=$(cd terraform && terraform output -raw agent_gateway_id)
+export MCP_INVOKER_SA=$(cd terraform && terraform output -raw agent_mcp_invoker_email)
+
 cd src/mortgage-agent
 uv sync
 uv run python deploy_agent.py \
   --project=${PROJECT_ID} --region=${REGION} \
   --enable-agent-identity --agent-name=mortgage-agent \
-  --agent-gateway=projects/${PROJECT_ID}/locations/${REGION}/agentGateways/agent-gateway \
+  --agent-gateway=${AGENT_GATEWAY} \
+  --mcp-invoker-sa=${MCP_INVOKER_SA} \
   --model-endpoint-location=global
-# Capture AGENT_ID from the output
+# Do not pass --network-attachment with --agent-gateway; Agent Runtime rejects
+# specs that set both pscInterfaceConfig and agentGatewayConfig. The deploy
+# command fails if the deployed spec is missing agentGatewayConfig.
+# Capture AGENT_ID from the output.
 cd ../..
 
-# 8. Grant per-MCP egress IAM for the deployed agent
+# 8. Grant Agent Gateway IAP egress IAM for the deployed agent
 ./scripts/grant_agent_mcp_egress.sh \
   --mcp \
-  --agent-id ${AGENT_ID} \
-  --mcp-filter "legacy-dms income-verification"
+  --endpoints \
+  --agent-id ${AGENT_ID}
 ```
 
 ## Test, register, clean up

@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 from collections.abc import AsyncIterator
 
 from starlette.applications import Starlette
@@ -16,13 +17,28 @@ _sync_methods: set[str] = set()
 _SESSION_METHODS = {"async_stream_query", "stream_query"}
 
 
+class MortgageAdkApp(AdkApp):
+    def __init__(self, *, project_id: str | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self._mortgage_project_id = project_id
+        if project_id:
+            self._tmpl_attrs["project"] = project_id
+
+    def project_id(self) -> str | None:
+        if self._mortgage_project_id:
+            return self._mortgage_project_id
+        return super().project_id()
+
+
 def _get_runtime() -> AdkApp:
     global _runtime, _streaming_methods, _sync_methods
     if _runtime is None:
         from agent.agent import app as adk_app
 
-        _runtime = AdkApp(
+        project_id = os.environ.get("MCP_REGISTRY_PROJECT")
+        _runtime = MortgageAdkApp(
             app=adk_app,
+            project_id=project_id,
             session_service_builder=services.get_session_service,
             artifact_service_builder=services.get_artifact_service,
         )
@@ -80,8 +96,13 @@ async def stream_reasoning_engine(request: Request) -> StreamingResponse | JSONR
     runtime_input = await _runtime_input(body)
 
     async def generator() -> AsyncIterator[str]:
-        async for event in method(**runtime_input):
-            yield json.dumps(event) + "\n"
+        events = method(**runtime_input)
+        if hasattr(events, "__aiter__"):
+            async for event in events:
+                yield json.dumps(event) + "\n"
+        else:
+            for event in events:
+                yield json.dumps(event) + "\n"
 
     return StreamingResponse(generator(), media_type="application/json")
 

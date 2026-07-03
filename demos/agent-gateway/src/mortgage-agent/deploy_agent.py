@@ -30,9 +30,10 @@ Usage:
     python deploy_agent.py --project=PROJECT_ID --region=us-central1 \
         --update=projects/PROJECT/locations/REGION/reasoningEngines/ENGINE_ID
 
-    # Create with PSC Interface and agent identity
+    # Create with Agent Gateway, agent identity, and MCP invoker SA
     python deploy_agent.py --project=PROJECT_ID --region=us-central1 \
-        --network-attachment=projects/PROJECT/regions/REGION/networkAttachments/NAME \
+        --agent-gateway=projects/PROJECT/locations/REGION/agentGateways/GATEWAY \
+        --mcp-invoker-sa=agent-mcp-invoker@PROJECT.iam.gserviceaccount.com \
         --enable-agent-identity
 
     # Pin the model endpoint to a specific location (default: global)
@@ -49,6 +50,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -235,6 +237,101 @@ def _existing_plain_env_vars(agent: object) -> dict[str, str]:
     return result
 
 
+def _get_api_field(value: object, *names: str) -> object | None:
+    """Read a nested field from dict/proto-plus objects using snake/camel names."""
+    current = value
+    for name in names:
+        if current is None:
+            return None
+        candidates = (name, _snake_to_camel(name))
+        found = None
+        for candidate in candidates:
+            if isinstance(current, dict):
+                if candidate in current:
+                    found = current[candidate]
+                    break
+            elif hasattr(current, candidate):
+                found = getattr(current, candidate)
+                break
+        current = found
+    return current
+
+
+def _snake_to_camel(value: str) -> str:
+    parts = value.split("_")
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _api_resource_as_dict(api_resource: object) -> dict:
+    if isinstance(api_resource, dict):
+        return api_resource
+    to_dict = getattr(api_resource, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return to_dict()
+        except TypeError:
+            return type(api_resource).to_dict(api_resource)
+    pb = getattr(api_resource, "_pb", None)
+    if pb is not None:
+        from google.protobuf.json_format import MessageToDict
+
+        return MessageToDict(pb, preserving_proto_field_name=True)
+    return {}
+
+
+def _verify_agent_gateway_config(engine: object, expected_agent_gateway: str) -> None:
+    resource = getattr(engine, "api_resource", engine)
+    config = _get_api_field(resource, "spec", "deployment_spec", "agent_gateway_config")
+    if config is None:
+        config = _get_api_field(_api_resource_as_dict(resource), "spec", "deployment_spec", "agent_gateway_config")
+    actual_agent_gateway = _get_api_field(config, "agent_to_anywhere_config", "agent_gateway") if config else None
+
+    if not actual_agent_gateway:
+        name = _get_api_field(resource, "name") or "unknown"
+        raise RuntimeError(
+            "Deployment completed, but the Reasoning Engine spec is missing "
+            f"spec.deploymentSpec.agentGatewayConfig for {name}."
+        )
+    if actual_agent_gateway != expected_agent_gateway:
+        raise RuntimeError(
+            "Deployment completed, but the Reasoning Engine spec has an unexpected Agent Gateway: "
+            f"{actual_agent_gateway!r} (expected {expected_agent_gateway!r})."
+        )
+
+
+def _access_token() -> str:
+    credentials = _credentials_from_access_token()
+    if credentials:
+        return credentials.token
+
+    import google.auth
+    import google.auth.transport.requests
+
+    credentials, _ = google.auth.default()
+    credentials.refresh(google.auth.transport.requests.Request())
+    return credentials.token
+
+
+def _fetch_agent_gateway_root_certificates_b64(agent_gateway: str) -> str | None:
+    url = f"https://networkservices.googleapis.com/v1alpha1/{agent_gateway}"
+    headers = {"Authorization": f"Bearer {_access_token()}"}
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise RuntimeError(f"Failed to fetch Agent Gateway card: {e.code} {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to fetch Agent Gateway card: {e}") from e
+
+    certificates = _get_api_field(payload, "agent_gateway_card", "root_certificates") or []
+    if not certificates:
+        return None
+    pem = "\n".join(str(certificate).rstrip() for certificate in certificates if certificate)
+    return base64.b64encode(pem.encode("utf-8")).decode("ascii")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deploy mortgage assistant agent to Vertex AI Agent Engine")
     parser.add_argument(
@@ -377,6 +474,11 @@ def main() -> None:
 
     if not args.project:
         parser.error("--project is required (or set $PROJECT_ID)")
+    if args.agent_gateway and args.network_attachment:
+        parser.error(
+            "--agent-gateway and --network-attachment cannot be used together; "
+            "Agent Runtime rejects specs with both agentGatewayConfig and pscInterfaceConfig."
+        )
 
     ge_deploy_needed = args.ge_deploy or args.ge_deploy_only
     oauth_client_secret = None
@@ -463,6 +565,11 @@ def main() -> None:
         os.environ["MCP_REGISTRY_ENDPOINT"] = args.registry_endpoint
     if args.mcp_invoker_sa:
         os.environ["MCP_INVOKER_SA_EMAIL"] = args.mcp_invoker_sa
+    agent_gateway_root_certificates_b64 = None
+    if args.agent_gateway:
+        agent_gateway_root_certificates_b64 = _fetch_agent_gateway_root_certificates_b64(args.agent_gateway)
+        if agent_gateway_root_certificates_b64:
+            os.environ["AGENT_GATEWAY_ROOT_CERTIFICATES_B64"] = agent_gateway_root_certificates_b64
 
     import vertexai
 
@@ -534,6 +641,11 @@ def main() -> None:
             **({"MCP_REGISTRY_FILTER": args.registry_filter} if args.registry_filter else {}),
             **({"MCP_REGISTRY_ENDPOINT": args.registry_endpoint} if args.registry_endpoint else {}),
             **({"MCP_INVOKER_SA_EMAIL": args.mcp_invoker_sa} if args.mcp_invoker_sa else {}),
+            **(
+                {"AGENT_GATEWAY_ROOT_CERTIFICATES_B64": agent_gateway_root_certificates_b64}
+                if agent_gateway_root_certificates_b64
+                else {}
+            ),
         }
         if args.update:
             existing_agent = client.agent_engines.get(name=args.update)
@@ -582,6 +694,8 @@ def main() -> None:
 
         reasoning_engine_name = operation.name.rsplit("/operations/", 1)[0]
         engine = client.agent_engines.get(name=reasoning_engine_name)
+        if args.agent_gateway:
+            _verify_agent_gateway_config(engine, args.agent_gateway)
     finally:
         os.chdir(original_cwd)
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -598,6 +712,8 @@ def main() -> None:
         print(f'  agent_engine_resource_name = "{reasoning_engine_name}"')
         if args.enable_agent_identity:
             print("\nAgent identity enabled. Grant IAM to the agent's principal shown above.")
+    if args.agent_gateway:
+        print("Agent Gateway config verified on deployed Reasoning Engine.")
 
     if args.ge_deploy:
         print()

@@ -24,6 +24,11 @@ output "foundation_project_number" {
   value       = module.foundation.project_number
 }
 
+output "organization_id" {
+  description = "The GCP organization ID used for Agent Identity principal URIs"
+  value       = var.organization_id
+}
+
 # Networking Module Outputs
 
 output "vpc_id" {

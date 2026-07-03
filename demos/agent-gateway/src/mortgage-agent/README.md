@@ -25,9 +25,8 @@ Get values from Terraform:
 cd ../../terraform
 
 export PROJECT_ID=$(terraform output -raw foundation_project_id)
-export VPC_NAME=$(terraform output -raw vpc_name)
-export PSC_ATTACHMENT=$(terraform output -raw psc_interface_network_attachment_id)
-export DNS_PEERING_DOMAIN=$(terraform output -raw psc_interface_dns_peering_domain)
+export AGENT_GATEWAY=$(terraform output -raw agent_gateway_id)
+export MCP_INVOKER_SA=$(terraform output -raw agent_mcp_invoker_email)
 ```
 
 Create a new Agent Runtime engine:
@@ -37,10 +36,8 @@ cd ../src/mortgage-agent
 
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --network-attachment=$PSC_ATTACHMENT \
-  --dns-peering-domain=$DNS_PEERING_DOMAIN \
-  --dns-peering-target-project=$PROJECT_ID \
-  --dns-peering-target-network=$VPC_NAME \
+  --agent-gateway=$AGENT_GATEWAY \
+  --mcp-invoker-sa=$MCP_INVOKER_SA \
   --enable-agent-identity
 ```
 
@@ -49,13 +46,18 @@ Update an existing engine:
 ```bash
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --network-attachment=$PSC_ATTACHMENT \
-  --dns-peering-domain=$DNS_PEERING_DOMAIN \
-  --dns-peering-target-project=$PROJECT_ID \
-  --dns-peering-target-network=$VPC_NAME \
+  --agent-gateway=$AGENT_GATEWAY \
+  --mcp-invoker-sa=$MCP_INVOKER_SA \
   --enable-agent-identity \
   --update=projects/PROJECT_NUMBER/locations/us-central1/reasoningEngines/ENGINE_ID
 ```
+
+The deploy command reads the deployed Reasoning Engine spec after create or
+update and fails if `spec.deploymentSpec.agentGatewayConfig` is missing or
+points at a different gateway than `--agent-gateway`.
+Do not pass `--network-attachment` with `--agent-gateway`: Agent Runtime
+rejects deployment specs that set both `pscInterfaceConfig` and
+`agentGatewayConfig`.
 
 ## A2A Smoke Test
 
@@ -98,10 +100,8 @@ export OAUTH_CLIENT_SECRET=<your-oauth-client-secret>
 
 uv run python deploy_agent.py \
   --project=$PROJECT_ID \
-  --network-attachment=$PSC_ATTACHMENT \
-  --dns-peering-domain=$DNS_PEERING_DOMAIN \
-  --dns-peering-target-project=$PROJECT_ID \
-  --dns-peering-target-network=$VPC_NAME \
+  --agent-gateway=$AGENT_GATEWAY \
+  --mcp-invoker-sa=$MCP_INVOKER_SA \
   --enable-agent-identity \
   --ge-deploy \
   --app-id=<gemini-enterprise-engine-id> \

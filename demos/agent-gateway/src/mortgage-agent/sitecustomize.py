@@ -21,7 +21,10 @@ the application and before Vertex/ADK telemetry setup.
 
 from __future__ import annotations
 
+import base64
 import os
+import ssl
+from pathlib import Path
 
 
 def _disable_urllib3_pyopenssl_when_mtls_disabled() -> None:
@@ -55,4 +58,40 @@ def _disable_urllib3_pyopenssl_when_mtls_disabled() -> None:
         pass
 
 
+def _install_agent_gateway_root_certificates() -> None:
+    encoded = os.getenv("AGENT_GATEWAY_ROOT_CERTIFICATES_B64")
+    if not encoded:
+        return
+
+    try:
+        extra_pem = base64.b64decode(encoded).decode("utf-8")
+    except Exception:
+        return
+
+    ca_bundle = Path("/tmp/agent_gateway_ca_bundle.pem")
+    parts: list[str] = []
+    try:
+        import certifi
+
+        parts.append(Path(certifi.where()).read_text())
+    except Exception:
+        default_cafile = ssl.get_default_verify_paths().cafile
+        if default_cafile:
+            try:
+                parts.append(Path(default_cafile).read_text())
+            except Exception:
+                pass
+    parts.append(extra_pem)
+
+    try:
+        ca_bundle.write_text("\n".join(part.rstrip() for part in parts if part) + "\n")
+    except Exception:
+        return
+
+    os.environ.setdefault("SSL_CERT_FILE", str(ca_bundle))
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", str(ca_bundle))
+    os.environ.setdefault("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", str(ca_bundle))
+
+
+_install_agent_gateway_root_certificates()
 _disable_urllib3_pyopenssl_when_mtls_disabled()
